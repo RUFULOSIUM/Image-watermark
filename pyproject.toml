@@ -12,6 +12,7 @@ dependencies = [
     "numpy>=2.5.3",
     "opencv-python>=5.0.0.93",
     "pillow>=12.3.0",
+    "pytest>=9.1.1",
     "reedsolo>=1.7.0",
 ]
 

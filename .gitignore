@@ -3,3 +3,4 @@ __pycache__/
 *.py[cod]
 private_key.pem
 public_key.pem
+.pytest_cache
