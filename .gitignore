@@ -5,6 +5,4 @@ private_key.pem
 public_key.pem
 benchmark/
 benchmark_results.csv
-=======
 .pytest_cache
->>>>>>> tests

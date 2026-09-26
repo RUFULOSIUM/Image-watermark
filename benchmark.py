@@ -33,7 +33,7 @@ TEST_PAYLOADS = [
     {
         "prompt": "A calm lake at sunrise with a lone fisherman.",
         "model": "test-model-a",
-        "version": "v0.1.0",
+        "version": "v0.2.0",
     },
     {
         "prompt": (
@@ -107,6 +107,8 @@ def decode_and_verify(path):
     image = np.array(Image.open(path).convert("RGB"))
     height, width, _ = image.shape
 
+    fallback = None
+
     try:
         rs = RSCodec(decode.RS_PARITY)
 
@@ -121,17 +123,23 @@ def decode_and_verify(path):
                 if payload_length is None:
                     continue
 
-                encoded_length = payload_length + decode.RS_PARITY
+                encoded_length = decode.rs_len(payload_length)
                 raw = decode.decode_tile(tile, encoded_length)
                 decoded = bytes(rs.decode(raw)[0])
                 payload = decode.parse_payload(decoded)
 
                 valid = decode.verify_signature(payload)
-                return True, valid
+
+                # Ein gueltig signierter Payload hat Vorrang.
+                if valid:
+                    return True, True
+
+                if fallback is None:
+                    fallback = (True, False)
     except Exception:
         pass
 
-    return False, False
+    return fallback if fallback else (False, False)
 
 
 def run_case(case_index, output_root, width, height, payload):
@@ -148,7 +156,7 @@ def run_case(case_index, output_root, width, height, payload):
     original = np.array(Image.open(original_path).convert("RGB"))
     original_bytes = os.path.getsize(original_path)
 
-    computed_payload = encode.create_payload(
+    computed_payload = encode.create_compressed_payload(
         payload["prompt"],
         payload["model"],
         payload["version"],

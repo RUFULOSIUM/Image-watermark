@@ -3,7 +3,10 @@ import sys
 import time
 import struct
 import zlib
+import lzma
 import uuid
+
+from typing import NoReturn
 
 import cv2
 import numpy as np
@@ -13,25 +16,53 @@ from reedsolo import RSCodec
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives import serialization
 
+from image_watermark.rs import RS_PARITY, max_message_length, rs_len
+
 
 # ============================================================
 # CONFIG
 # ============================================================
 
 TILE_SIZE = 512
-RS_PARITY = 32
+
+MAGIC = b"WM01"
+
+SIGNATURE_SIZE = 64
+
+# Magic (4) + Laenge des komprimierten Bodies (2)
+HEADER_SIZE = 6
 
 COEF_A = (3, 4)
 COEF_B = (4, 3)
 
 STRENGTH = 12.0
 
+# ---------------------------------------------------------
+# Kapazitaet
+#
+# Ein 512x512 Tile hat 64x64 = 4096 Bloecke, also 4096 Bit
+# = 512 Byte fuer das RS-Codeword.
+# ---------------------------------------------------------
+
+TILE_BLOCKS = (TILE_SIZE // 8) ** 2
+TILE_BYTES = TILE_BLOCKS // 8
+
+# reedsolo haengt 32 Parity-Byte an JEDEN 223-Byte-Block an.
+# Ein Payload passt also nur in einen Tile, wenn sein Codeword
+# die 512 Byte nicht ueberschreitet. Die Grenze wird berechnet,
+# nicht geraten.
+MAX_PAYLOAD_SIZE = max_message_length(TILE_BYTES)
+
+MAX_COMPRESSED_LENGTH = (
+    MAX_PAYLOAD_SIZE - HEADER_SIZE - SIGNATURE_SIZE
+)
+
 
 # ============================================================
 # CLEAN EXIT
 # ============================================================
 
-def error(message):
+def error(message) -> NoReturn:
     sys.exit(f"ERROR: {message}")
 
 
@@ -64,7 +95,7 @@ def create_keys():
     print("Created public_key.pem")
 
 
-def load_private_key():
+def load_private_key() -> Ed25519PrivateKey:
     if not os.path.exists("private_key.pem"):
         error(
             "private_key.pem not found. "
@@ -73,19 +104,24 @@ def load_private_key():
 
     try:
         with open("private_key.pem", "rb") as f:
-            return serialization.load_pem_private_key(
+            key = serialization.load_pem_private_key(
                 f.read(),
                 password=None
             )
     except Exception:
         error("Could not load private_key.pem.")
 
+    if not isinstance(key, Ed25519PrivateKey):
+        error("private_key.pem is not an Ed25519 key.")
+
+    return key
+
 
 # ============================================================
 # PAYLOAD
 # ============================================================
 
-def create_payload(prompt, model, version):
+def create_compressed_payload(prompt, model, version):
 
     model_bytes = model.encode("utf-8")
     version_bytes = version.encode("utf-8")
@@ -107,10 +143,13 @@ def create_payload(prompt, model, version):
 
     # --------------------------------------------------------
     # Payload body
+    #
+    # Unkomprimiert. Wird mit LZMA komprimiert und
+    # anschliessend signiert.
     # --------------------------------------------------------
-
     body = (
-        b"WM01" +
+
+        MAGIC +
 
         # Model
         bytes([len(model_bytes)]) +
@@ -133,15 +172,48 @@ def create_payload(prompt, model, version):
         compressed_prompt
     )
 
+    compressed_body = lzma.compress(
+        body,
+        lzma.FORMAT_XZ,
+        preset=9
+    )
+
+    if len(compressed_body) > MAX_COMPRESSED_LENGTH:
+        error(
+            f"Compressed payload is too large "
+            f"({len(compressed_body)} bytes, "
+            f"max {MAX_COMPRESSED_LENGTH})."
+        )
+
     # --------------------------------------------------------
     # Sign body
+    #
+    # Signiert wird der unkomprimierte Body, nicht der
+    # LZMA-Stream. So ist die Signatur unabhaengig von der
+    # Kompressions-Einstellung.
     # --------------------------------------------------------
 
     private_key = load_private_key()
 
     signature = private_key.sign(body)
 
-    return body + signature
+    # --------------------------------------------------------
+    # Container
+    #
+    # Die Laenge des komprimierten Bodies steht im Klartext,
+    # weil der Decoder sie kennen muss, BEVOR er den Body
+    # dekomprimieren kann.
+    # --------------------------------------------------------
+
+    return (
+        MAGIC +
+        struct.pack(
+            ">H",
+            len(compressed_body)
+        ) +
+        compressed_body +
+        signature
+    )
 
 
 # ============================================================
@@ -153,9 +225,23 @@ def reed_solomon_encode(data):
     rs = RSCodec(RS_PARITY)
 
     try:
-        return bytes(rs.encode(data))
+        encoded = bytes(rs.encode(data))
     except Exception as e:
         error(f"Reed-Solomon encoding failed: {e}")
+
+    # Der Decoder berechnet die Laenge des Codewords ueber
+    # rs_len(). Wenn reedsolo anders chunkt, ist die Laenge
+    # falsch und jedes Payload groesser als ein Chunk ist
+    # nicht mehr dekodierbar. Deshalb hier pruefen.
+    expected = rs_len(len(data))
+
+    if len(encoded) != expected:
+        error(
+            f"Unexpected Reed-Solomon length: "
+            f"got {len(encoded)} bytes, expected {expected}."
+        )
+
+    return encoded
 
 
 # ============================================================
@@ -316,7 +402,7 @@ def encode_image(
 
     print("[2/5] Creating payload...")
 
-    payload = create_payload(
+    payload = create_compressed_payload(
         prompt,
         model,
         version
@@ -340,20 +426,28 @@ def encode_image(
         f"      Encoded: {len(encoded)} bytes"
     )
 
+    # --------------------------------------------------------
+    # Kapazitaet
+    #
+    # Ein Tile hat 64x64 = 4096 DCT-Bloecke und damit
+    # 4096 Bit = 512 Byte Platz. Das RS-Codeword muss
+    # komplett hineinpassen.
+    # --------------------------------------------------------
+
+    if len(payload) > MAX_PAYLOAD_SIZE:
+        error(
+            f"Payload too large for one tile "
+            f"({len(payload)} bytes, max {MAX_PAYLOAD_SIZE})."
+        )
+
     bits = bytes_to_bits(
         encoded
     )
 
-    # 256x256 tile = 32x32 DCT blocks
-    max_bits = (
-        (TILE_SIZE // 8) *
-        (TILE_SIZE // 8)
-    )
-
-    if len(bits) > max_bits:
+    if len(bits) > TILE_BLOCKS:
         error(
-            f"Payload too large for one tile "
-            f"({len(bits)} bits, max {max_bits})."
+            f"Encoded payload too large for one tile "
+            f"({len(bits)} bits, max {TILE_BLOCKS})."
         )
 
     print(

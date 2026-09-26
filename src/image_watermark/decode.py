@@ -2,6 +2,9 @@ import os
 import sys
 import struct
 import zlib
+import lzma
+
+from typing import NoReturn
 
 import cv2
 import numpy as np
@@ -9,6 +12,11 @@ from PIL import Image
 
 from reedsolo import RSCodec
 from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PublicKey,
+)
+
+from image_watermark.rs import RS_PARITY, rs_len
 
 
 # ============================================================
@@ -16,17 +24,27 @@ from cryptography.hazmat.primitives import serialization
 # ============================================================
 
 TILE_SIZE = 512
-RS_PARITY = 32
+
+MAGIC = b"WM01"
+
+SIGNATURE_SIZE = 64
+
+# Magic (4) + Laenge des komprimierten Bodies (2)
+HEADER_SIZE = 6
 
 COEF_A = (3, 4)
 COEF_B = (4, 3)
+
+# Ein Tile hat 64x64 DCT-Bloecke, also 512 Byte Bit-Kapazitaet.
+TILE_BLOCKS = (TILE_SIZE // 8) ** 2
+TILE_BYTES = TILE_BLOCKS // 8
 
 
 # ============================================================
 # CLEAN EXIT
 # ============================================================
 
-def error(message):
+def error(message) -> NoReturn:
     sys.exit(f"ERROR: {message}")
 
 
@@ -34,19 +52,24 @@ def error(message):
 # PUBLIC KEY
 # ============================================================
 
-def load_public_key():
+def load_public_key() -> Ed25519PublicKey:
 
     if not os.path.exists("public_key.pem"):
         error("public_key.pem not found.")
 
     try:
         with open("public_key.pem", "rb") as f:
-            return serialization.load_pem_public_key(
+            key = serialization.load_pem_public_key(
                 f.read()
             )
 
     except Exception as e:
         error(f"Could not load public key: {e}")
+
+    if not isinstance(key, Ed25519PublicKey):
+        error("public_key.pem is not an Ed25519 key.")
+
+    return key
 
 
 # ============================================================
@@ -126,134 +149,62 @@ def bits_to_bytes(bits):
 def get_payload_length(tile):
 
     # --------------------------------------------------------
-    # We need enough bytes to reach the prompt length.
+    # Der komplette Body ist LZMA-komprimiert. Seine innere
+    # Struktur (Model, Version, UUID, Timestamp, Prompt) ist
+    # deshalb nicht im Klartext lesbar.
     #
-    # Minimum structure before prompt:
+    # Nur der Container-Header steht unkomprimiert:
     #
-    # WM01       4
-    # model len  1
-    # model      0+
-    # version    1
-    # version    0+
-    # UUID       16
-    # timestamp  8
-    # prompt len 2
+    # magic              4
+    # compressed length  2
     #
-    # With empty model/version:
-    #
-    # 4 + 1 + 1 + 16 + 8 + 2 = 32
-    #
-    # Read a bit more to safely reach it.
+    # Die Laenge wird gebraucht, um zu wissen wie viele Bytes
+    # aus dem Bild gelesen werden muessen. Ohne sie ist das
+    # Reed-Solomon-Decoding nicht moeglich, weil die Laenge des
+    # Codeworts exakt bekannt sein muss.
     # --------------------------------------------------------
-
-    bootstrap_bytes = 64
 
     bits = extract_bits(
         tile,
-        bootstrap_bytes * 8
+        HEADER_SIZE * 8
     )
 
     data = bits_to_bytes(bits)
-
-    if len(data) < 34:
-        return None
 
     # --------------------------------------------------------
     # Magic
     # --------------------------------------------------------
 
-    if data[:4] != b"WM01":
+    if data[:4] != MAGIC:
         return None
 
-    pos = 4
-
     # --------------------------------------------------------
-    # Model
+    # Laenge des komprimierten Bodies
     # --------------------------------------------------------
 
-    if pos >= len(data):
-        return None
-
-    model_len = data[pos]
-    pos += 1
-
-    if pos + model_len > len(data):
-        return None
-
-    pos += model_len
-
-    # --------------------------------------------------------
-    # Version
-    # --------------------------------------------------------
-
-    if pos >= len(data):
-        return None
-
-    version_len = data[pos]
-    pos += 1
-
-    if pos + version_len > len(data):
-        return None
-
-    pos += version_len
-
-    # --------------------------------------------------------
-    # UUID
-    # --------------------------------------------------------
-
-    if pos + 16 > len(data):
-        return None
-
-    pos += 16
-
-    # --------------------------------------------------------
-    # Timestamp
-    # --------------------------------------------------------
-
-    if pos + 8 > len(data):
-        return None
-
-    pos += 8
-
-    # --------------------------------------------------------
-    # Prompt length
-    # --------------------------------------------------------
-
-    if pos + 2 > len(data):
-        return None
-
-    prompt_len = struct.unpack(
+    compressed_length = struct.unpack(
         ">H",
-        data[pos:pos + 2]
+        data[4:HEADER_SIZE]
     )[0]
 
-    pos += 2
+    # 0 kann kein gueltiger LZMA-Stream sein
+    if compressed_length == 0:
+        return None
 
-    # --------------------------------------------------------
-    # Total payload:
-    #
-    # body + 64 byte Ed25519 signature
-    # --------------------------------------------------------
-
-    body_length = pos + prompt_len
-
-    total_payload_length = (
-        body_length + 64
+    return (
+        HEADER_SIZE +
+        compressed_length +
+        SIGNATURE_SIZE
     )
-
-    return total_payload_length
 
 
 # ============================================================
 # PARSE PAYLOAD
 # ============================================================
 
-def parse_payload(data):
+def parse_body(raw):
 
-    if len(data) < 4:
-        raise ValueError("Payload too small.")
-
-    if data[:4] != b"WM01":
+    if raw[:4] != MAGIC:
         raise ValueError("Invalid watermark magic.")
 
     pos = 4
@@ -262,16 +213,16 @@ def parse_payload(data):
     # Model
     # --------------------------------------------------------
 
-    if pos >= len(data):
+    if pos >= len(raw):
         raise ValueError("Missing model length.")
 
-    model_len = data[pos]
+    model_len = raw[pos]
     pos += 1
 
-    if pos + model_len > len(data):
+    if pos + model_len > len(raw):
         raise ValueError("Invalid model length.")
 
-    model = data[
+    model = raw[
         pos:pos + model_len
     ].decode("utf-8")
 
@@ -281,16 +232,16 @@ def parse_payload(data):
     # Version
     # --------------------------------------------------------
 
-    if pos >= len(data):
+    if pos >= len(raw):
         raise ValueError("Missing version length.")
 
-    version_len = data[pos]
+    version_len = raw[pos]
     pos += 1
 
-    if pos + version_len > len(data):
+    if pos + version_len > len(raw):
         raise ValueError("Invalid version length.")
 
-    version = data[
+    version = raw[
         pos:pos + version_len
     ].decode("utf-8")
 
@@ -300,10 +251,10 @@ def parse_payload(data):
     # UUID
     # --------------------------------------------------------
 
-    if pos + 16 > len(data):
+    if pos + 16 > len(raw):
         raise ValueError("Missing image ID.")
 
-    image_id = data[
+    image_id = raw[
         pos:pos + 16
     ].hex()
 
@@ -313,12 +264,12 @@ def parse_payload(data):
     # Timestamp
     # --------------------------------------------------------
 
-    if pos + 8 > len(data):
+    if pos + 8 > len(raw):
         raise ValueError("Missing timestamp.")
 
     timestamp = struct.unpack(
         ">Q",
-        data[pos:pos + 8]
+        raw[pos:pos + 8]
     )[0]
 
     pos += 8
@@ -327,12 +278,12 @@ def parse_payload(data):
     # Prompt length
     # --------------------------------------------------------
 
-    if pos + 2 > len(data):
+    if pos + 2 > len(raw):
         raise ValueError("Missing prompt length.")
 
     prompt_len = struct.unpack(
         ">H",
-        data[pos:pos + 2]
+        raw[pos:pos + 2]
     )[0]
 
     pos += 2
@@ -341,27 +292,14 @@ def parse_payload(data):
     # Prompt
     # --------------------------------------------------------
 
-    if pos + prompt_len > len(data):
+    if pos + prompt_len > len(raw):
         raise ValueError("Invalid prompt length.")
 
-    compressed_prompt = data[
+    compressed_prompt = raw[
         pos:pos + prompt_len
     ]
 
     pos += prompt_len
-
-    # --------------------------------------------------------
-    # Signature
-    # --------------------------------------------------------
-
-    if pos + 64 > len(data):
-        raise ValueError("Missing signature.")
-
-    signature = data[
-        pos:pos + 64
-    ]
-
-    body = data[:pos]
 
     # --------------------------------------------------------
     # Decompress prompt
@@ -382,10 +320,107 @@ def parse_payload(data):
         "version": version,
         "image_id": image_id,
         "timestamp": timestamp,
-        "prompt": prompt,
-        "signature": signature,
-        "body": body
+        "prompt": prompt
     }
+
+
+# ============================================================
+# PARSE PAYLOAD
+# ============================================================
+
+def parse_payload(data):
+
+    # --------------------------------------------------------
+    # Container
+    #
+    # magic              4
+    # compressed length  2
+    # compressed body    N
+    # signature          64
+    # --------------------------------------------------------
+
+    if len(data) < HEADER_SIZE + SIGNATURE_SIZE:
+        raise ValueError("Payload too small.")
+
+    if data[:4] != MAGIC:
+        raise ValueError("Invalid watermark magic.")
+
+    compressed_length = struct.unpack(
+        ">H",
+        data[4:HEADER_SIZE]
+    )[0]
+
+    pos = HEADER_SIZE
+
+    expected = pos + compressed_length + SIGNATURE_SIZE
+
+    if expected > len(data):
+        raise ValueError(
+            "Invalid compressed body length."
+        )
+
+    # Der Container muss exakt passen. Zusaetzliche Bytes
+    # wuerden auf einen falschen Kandidaten hindeuten
+    # (falsche RS-Laenge) und duerfen nicht stillschweigend
+    # verworfen werden.
+    if expected != len(data):
+        raise ValueError(
+            "Unexpected trailing data after signature "
+            f"({len(data) - expected} bytes)."
+        )
+
+    compressed_body = data[
+        pos:pos + compressed_length
+    ]
+
+    signature = data[
+        pos + compressed_length:
+    ][:SIGNATURE_SIZE]
+
+    # --------------------------------------------------------
+    # Decompress body
+    #
+    # LZMADecompressor statt lzma.decompress: Letzteres
+    # ignoriert angehaengte Bytes stillschweigend. Ein
+    # unvollstaendig oder zu lang gelesener Stream soll
+    # hier auffallen und nicht als gueltig durchgehen.
+    # --------------------------------------------------------
+
+    try:
+        decompressor = lzma.LZMADecompressor(
+            format=lzma.FORMAT_XZ
+        )
+
+        body = decompressor.decompress(
+            compressed_body
+        )
+
+        if not decompressor.eof:
+            raise ValueError(
+                "Incomplete LZMA stream."
+            )
+
+        if decompressor.unused_data:
+            raise ValueError(
+                "Trailing data after LZMA stream."
+            )
+
+    except lzma.LZMAError as e:
+        raise ValueError(
+            f"Body decompression failed: {e}"
+        )
+
+    # --------------------------------------------------------
+    # Innere Struktur
+    # --------------------------------------------------------
+
+    payload = parse_body(body)
+
+    # Signiert wurde der unkomprimierte Body
+    payload["signature"] = signature
+    payload["body"] = body
+
+    return payload
 
 
 # ============================================================
@@ -466,19 +501,15 @@ def decode_image(path):
     # Capacity
     # --------------------------------------------------------
 
-    max_bits = (
-        (TILE_SIZE // 8) *
-        (TILE_SIZE // 8)
-    )
-
-    max_bytes = max_bits // 8
+    max_bytes = TILE_BYTES
 
     print(
         f"      Tile size: {TILE_SIZE}x{TILE_SIZE}"
     )
 
     print(
-        f"      Capacity: {max_bytes} bytes"
+        f"      Capacity: {max_bytes} bytes "
+        f"(codeword)"
     )
 
     # --------------------------------------------------------
@@ -525,12 +556,19 @@ def decode_image(path):
             )
 
             # ------------------------------------------------
-            # Reed-Solomon adds parity
+            # Reed-Solomon-Laenge
+            #
+            # WICHTIG: reedsolo haengt 32 Parity-Byte an
+            # JEDEN 223-Byte-Block an. Ein Payload > 223
+            # Byte braucht also mehr als 32 Parity-Byte.
+            # Mit einem festen + RS_PARITY wurde ab der
+            # zweiten Chunk-Grenze die falsche Anzahl Byte
+            # aus dem Tile gelesen und jedes solche Payload
+            # war nicht dekodierbar.
             # ------------------------------------------------
 
-            encoded_length = (
-                payload_length +
-                RS_PARITY
+            encoded_length = rs_len(
+                payload_length
             )
 
             if encoded_length > max_bytes:
@@ -558,7 +596,7 @@ def decode_image(path):
                 )[0]
 
                 candidates.append(
-                    bytes(decoded)
+                    (tx, ty, bytes(decoded))
                 )
 
                 print(
@@ -589,7 +627,19 @@ def decode_image(path):
 
     print("[3/5] Parsing payload...")
 
-    for candidate in candidates:
+    # ----------------------------------------------------
+    # Parse
+    #
+    # Alle parsebaren Kandidaten sammeln, statt den ersten
+    # zurueckzugeben. Ein Tile kann per Zufall RS-dekodierbar
+    # sein, und ein frueher gefundener Kandidat kann eine
+    # falsche Signatur haben, waehrend ein spaeterer Tile
+    # den echten, korrekt signierten Payload enthaelt.
+    # ----------------------------------------------------
+
+    parsed = []
+
+    for tx, ty, candidate in candidates:
 
         try:
 
@@ -600,72 +650,116 @@ def decode_image(path):
         except Exception as e:
 
             print(
-                f"      Invalid payload: {e}"
+                f"      Tile ({tx},{ty}) "
+                f"invalid payload: {e}"
             )
 
             continue
 
-        # ----------------------------------------------------
-        # Verify
-        # ----------------------------------------------------
+        parsed.append(
+            (tx, ty, payload)
+        )
 
-        print("[4/5] Verifying signature...")
+    if not parsed:
+
+        error(
+            "Watermark data was found, "
+            "but could not be decoded."
+        )
+
+    # ----------------------------------------------------
+    # Verify
+    # ----------------------------------------------------
+
+    print("[4/5] Verifying signature...")
+
+    verified = []
+
+    for tx, ty, payload in parsed:
 
         valid = verify_signature(
             payload
         )
 
-        # ----------------------------------------------------
-        # Output
-        # ----------------------------------------------------
+        if not valid:
+            print(
+                f"      Tile ({tx},{ty}) "
+                f"signature INVALID"
+            )
 
-        print("[5/5] Done.")
-        print()
-
-        print("================================")
-        print(" WATERMARK FOUND")
-        print("================================")
-
-        print(
-            f"Model:       "
-            f"{payload['model'] or '(empty)'}"
+        verified.append(
+            (tx, ty, payload, valid)
         )
 
-        print(
-            f"Version:     "
-            f"{payload['version'] or '(empty)'}"
-        )
+    # ----------------------------------------------------
+    # Select
+    #
+    # Ein gueltig signierter Payload hat Vorrang. Erst wenn
+    # kein einziger Kandidat die Signatur besteht, wird ein
+    # parsebarer Kandidat gemeldet -- dann aber klar als
+    # INVALID markiert.
+    # ----------------------------------------------------
 
-        print(
-            f"Image ID:    "
-            f"{payload['image_id']}"
-        )
-
-        print(
-            f"Timestamp:   "
-            f"{payload['timestamp']}"
-        )
-
-        print(
-            f"Signature:   "
-            f"{'VALID' if valid else 'INVALID'}"
-        )
-
-        print()
-
-        print("Prompt:")
-        print(
-            payload["prompt"] or "(empty)"
-        )
-
-        print("================================")
-
-        return payload
-
-    error(
-        "Watermark data was found, "
-        "but could not be decoded."
+    selected = next(
+        (entry for entry in verified if entry[3]),
+        None,
     )
+
+    if selected is None:
+        selected = verified[0]
+
+    tx, ty, payload, valid = selected
+
+    # ----------------------------------------------------
+    # Output
+    # ----------------------------------------------------
+
+    print("[5/5] Done.")
+    print()
+
+    print("================================")
+    print(" WATERMARK FOUND")
+    print("================================")
+
+    print(
+        f"Tile:        ({tx},{ty})"
+    )
+
+    print(
+        f"Model:       "
+        f"{payload['model'] or '(empty)'}"
+    )
+
+    print(
+        f"Version:     "
+        f"{payload['version'] or '(empty)'}"
+    )
+
+    print(
+        f"Image ID:    "
+        f"{payload['image_id']}"
+    )
+
+    print(
+        f"Timestamp:   "
+        f"{payload['timestamp']}"
+    )
+
+    print(
+        f"Signature:   "
+        f"{'VALID' if valid else 'INVALID'}"
+    )
+
+    print()
+
+    print("Prompt:")
+    print(
+        payload["prompt"] or "(empty)"
+    )
+
+    print("================================")
+
+    return payload
 
 
 # ============================================================

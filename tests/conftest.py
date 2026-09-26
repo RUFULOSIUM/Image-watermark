@@ -1,5 +1,6 @@
 import struct
 import zlib
+import lzma
 
 import numpy as np
 import pytest
@@ -72,6 +73,43 @@ def make_payload():
 
         signature = private_key.sign(body)
 
-        return body + signature
+        compressed_body = lzma.compress(
+            body, lzma.FORMAT_XZ, preset=9
+        )
+
+        return (
+            b"WM01"
+            + struct.pack(">H", len(compressed_body))
+            + compressed_body
+            + signature
+        )
+
+    return _make
+
+
+@pytest.fixture
+def make_body():
+    """Build only the uncompressed, signed body (no LZMA container)."""
+
+    def _make(
+        prompt="prompt",
+        model="model",
+        version="v1.0",
+        image_id=b"\x00" * 16,
+        timestamp=1700000000,
+    ):
+        model_bytes = model.encode("utf-8")
+        version_bytes = version.encode("utf-8")
+        compressed = zlib.compress(prompt.encode("utf-8"))
+
+        return (
+            b"WM01"
+            + bytes([len(model_bytes)]) + model_bytes
+            + bytes([len(version_bytes)]) + version_bytes
+            + image_id
+            + struct.pack(">Q", timestamp)
+            + struct.pack(">H", len(compressed))
+            + compressed
+        )
 
     return _make
