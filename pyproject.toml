@@ -1,11 +1,8 @@
 [project]
 name = "image-watermark"
-version = "0.2.0"
-description = "Add your description here"
+version = "0.3.0"
+description = "Robust image watermarking with Reed-Solomon error correction, DCT embedding and pluggable payload schemas"
 readme = "README.md"
-authors = [
-    { name = "RUFULOSIUM", email = "rufuspregler@gmail.com" }
-]
 requires-python = ">=3.13"
 dependencies = [
     "cryptography>=50.0.1",
@@ -17,8 +14,21 @@ dependencies = [
 ]
 
 [project.scripts]
-image-watermark = "image_watermark:main"
+image-watermark = "image_watermark.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=9.1.1"]
 
 [build-system]
 requires = ["uv_build>=0.12.13,<0.13.0"]
 build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "image_watermark"
+# The default schema ships inside the package so it is readable from
+# an installed wheel, not just from a source checkout.
+module-root = "src"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

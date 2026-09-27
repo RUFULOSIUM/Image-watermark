@@ -136,7 +136,7 @@ wheels = [
 
 [[package]]
 name = "image-watermark"
-version = "0.2.0"
+version = "0.3.0"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },
@@ -145,6 +145,11 @@ dependencies = [
     { name = "pillow" },
     { name = "pytest" },
     { name = "reedsolo" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "pytest" },
 ]
 
 [package.metadata]
@@ -156,6 +161,9 @@ requires-dist = [
     { name = "pytest", specifier = ">=9.1.1" },
     { name = "reedsolo", specifier = ">=1.7.0" },
 ]
+
+[package.metadata.requires-dev]
+dev = [{ name = "pytest", specifier = ">=9.1.1" }]
 
 [[package]]
 name = "iniconfig"

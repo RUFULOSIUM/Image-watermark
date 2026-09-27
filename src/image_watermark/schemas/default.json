@@ -1,0 +1,42 @@
+{
+  "id": "default",
+  "version": 1,
+  "description": "The scheme used by this project since v0.2: model, version, image id, timestamp and prompt. Same fields, same order, same meaning as the WM01 body, but framed by the WM02 container and using 4 byte length prefixes. Use the legacy encode wrapper if you need byte exact WM01 output.",
+  "fields": [
+    {
+      "name": "model",
+      "type": "string",
+      "description": "Name of the model that produced the image",
+      "required": false
+    },
+    {
+      "name": "version",
+      "type": "string",
+      "description": "Version of the model or of the schema",
+      "required": false
+    },
+    {
+      "name": "image_id",
+      "type": "bytes",
+      "length": 16,
+      "display": "hex",
+      "default": "uuid4",
+      "description": "Random UUID identifying this watermark",
+      "required": false
+    },
+    {
+      "name": "timestamp",
+      "type": "uint64",
+      "default": "now",
+      "description": "Unix time at which the watermark was created",
+      "required": false
+    },
+    {
+      "name": "prompt",
+      "type": "string",
+      "compression": "zlib",
+      "description": "The prompt text",
+      "required": false
+    }
+  ]
+}

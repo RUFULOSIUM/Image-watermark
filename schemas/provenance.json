@@ -1,0 +1,49 @@
+{
+  "id": "provenance",
+  "version": 1,
+  "description": "Example of a completely different watermarking scheme. Instead of an AI generation prompt it records who owns the photo, where it was taken, when and with which camera. Nothing about the default scheme is assumed, and the field order below is the only thing that defines the binary layout.",
+  "fields": [
+    {
+      "name": "artist",
+      "type": "string",
+      "length": 128,
+      "description": "Name of the copyright holder",
+      "required": true
+    },
+    {
+      "name": "created",
+      "type": "uint64",
+      "default": "now",
+      "description": "Unix time the photo was taken",
+      "required": false
+    },
+    {
+      "name": "camera",
+      "type": "string",
+      "length": 64,
+      "description": "Camera body and lens",
+      "required": false
+    },
+    {
+      "name": "focal_mm",
+      "type": "uint16",
+      "description": "Focal length in millimetres",
+      "required": false
+    },
+    {
+      "name": "gps",
+      "type": "bytes",
+      "length": 16,
+      "display": "hex",
+      "description": "Coordinates packed as 2 x int32 latitude and longitude scaled by 1e7, which is the GeoJSON convention",
+      "required": false
+    },
+    {
+      "name": "note",
+      "type": "string",
+      "compression": "zlib",
+      "description": "Free form note, worth compressing because it is long and repetitive",
+      "required": false
+    }
+  ]
+}

@@ -1,61 +1,103 @@
-import os
-import sys
-import time
-import struct
-import zlib
+"""Procedural wrapper around :class:`WatermarkEncoder`.
+
+Kept for backwards compatibility with v0.1 and v0.2. Every function
+keeps its old signature, its old module constants and its old error
+messages, and it still terminates with ``SystemExit`` on failure.
+
+The important detail: this module still writes the **v0.2 byte format**
+(``WM01`` container, magic inside the body). That is what existing
+callers, existing images and the existing test suite expect. New code
+should use :class:`~image_watermark.encoder.WatermarkEncoder` with a
+:class:`~image_watermark.schema.PayloadSchema`, which produces the
+self-describing ``WM02`` container.
+"""
+
+from __future__ import annotations
+
 import lzma
-import uuid
+import os
+import struct
+import sys
 
 from typing import NoReturn
 
-import cv2
 import numpy as np
-from PIL import Image
-
 from reedsolo import RSCodec
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from cryptography.hazmat.primitives import serialization
 
-from image_watermark.rs import RS_PARITY, max_message_length, rs_len
+from image_watermark import dct
+from image_watermark.container import (
+    LEGACY_HEADER_SIZE,
+    MAGIC_LEGACY,
+)
+from image_watermark.container import (
+    SIGNATURE_SIZE as CONTAINER_SIGNATURE_SIZE,
+)
+from image_watermark.errors import (
+    CapacityError,
+    KeyFileError,
+    PayloadError,
+    WatermarkError,
+)
+from image_watermark.keys import (
+    DEFAULT_PRIVATE_KEY,
+    DEFAULT_PUBLIC_KEY,
+    generate_key_pair,
+)
+from image_watermark.keys import load_private_key as _read_private_key
+from image_watermark.legacy import (
+    LEGACY_MAX_PROMPT,
+    LEGACY_MAX_SHORT,
+    build_legacy_body,
+)
+from image_watermark.rs import (
+    RS_PARITY,
+    max_message_length,
+    rs_len,
+)
+from image_watermark.settings import WatermarkSettings
 
 
 # ============================================================
-# CONFIG
-# ============================================================
-
-TILE_SIZE = 512
-
-MAGIC = b"WM01"
-
-SIGNATURE_SIZE = 64
-
-# Magic (4) + Laenge des komprimierten Bodies (2)
-HEADER_SIZE = 6
-
-COEF_A = (3, 4)
-COEF_B = (4, 3)
-
-STRENGTH = 12.0
-
-# ---------------------------------------------------------
-# Kapazitaet
+# CONSTANTS
 #
-# Ein 512x512 Tile hat 64x64 = 4096 Bloecke, also 4096 Bit
-# = 512 Byte fuer das RS-Codeword.
-# ---------------------------------------------------------
+# The v0.2 values, derived from the default settings so there is a
+# single source of truth.
+# ============================================================
 
-TILE_BLOCKS = (TILE_SIZE // 8) ** 2
-TILE_BYTES = TILE_BLOCKS // 8
+_DEFAULT = WatermarkSettings()
 
-# reedsolo haengt 32 Parity-Byte an JEDEN 223-Byte-Block an.
-# Ein Payload passt also nur in einen Tile, wenn sein Codeword
-# die 512 Byte nicht ueberschreitet. Die Grenze wird berechnet,
-# nicht geraten.
+TILE_SIZE = _DEFAULT.tile_size
+BLOCK_SIZE = _DEFAULT.block_size
+
+COEF_A = _DEFAULT.coef_a
+COEF_B = _DEFAULT.coef_b
+STRENGTH = _DEFAULT.strength
+
+MAGIC = MAGIC_LEGACY
+
+SIGNATURE_SIZE = CONTAINER_SIGNATURE_SIZE
+
+#: Legacy ``WM01``: magic + 2 byte body length
+HEADER_SIZE = LEGACY_HEADER_SIZE
+
+#: A 512x512 tile holds 64x64 DCT blocks, one bit each.
+TILE_BLOCKS = _DEFAULT.block_count
+TILE_BYTES = _DEFAULT.capacity
+
+#: Largest container that survives one Reed-Solomon round trip.
 MAX_PAYLOAD_SIZE = max_message_length(TILE_BYTES)
 
+#: Largest compressed body that still leaves room for the framing.
 MAX_COMPRESSED_LENGTH = (
     MAX_PAYLOAD_SIZE - HEADER_SIZE - SIGNATURE_SIZE
 )
+
+PRIVATE_KEY = DEFAULT_PRIVATE_KEY
+PUBLIC_KEY = DEFAULT_PUBLIC_KEY
+
+MAX_MODEL_LENGTH = LEGACY_MAX_SHORT
+MAX_VERSION_LENGTH = LEGACY_MAX_SHORT
+MAX_PROMPT_LENGTH = LEGACY_MAX_PROMPT
 
 
 # ============================================================
@@ -66,153 +108,91 @@ def error(message) -> NoReturn:
     sys.exit(f"ERROR: {message}")
 
 
+def _guard(action, *args, **kwargs):
+    """Run ``action``, turning library errors into SystemExit."""
+
+    try:
+        return action(*args, **kwargs)
+
+    except CapacityError as e:
+        error(str(e))
+
+    except PayloadError as e:
+        error(str(e))
+
+    except KeyFileError as e:
+        error(str(e))
+
+    except WatermarkError as e:
+        error(str(e))
+
+    except ValueError as e:
+        error(str(e))
+
+
 # ============================================================
 # KEYS
 # ============================================================
 
-def create_keys():
-    private_key = Ed25519PrivateKey.generate()
-    public_key = private_key.public_key()
+def create_keys(
+    private_path: str = PRIVATE_KEY,
+    public_path: str = PUBLIC_KEY,
+) -> None:
+    """Create an Ed25519 key pair in the working directory."""
 
-    with open("private_key.pem", "wb") as f:
-        f.write(
-            private_key.private_bytes(
-                serialization.Encoding.PEM,
-                serialization.PrivateFormat.PKCS8,
-                serialization.NoEncryption()
-            )
-        )
+    try:
+        generate_key_pair(private_path, public_path)
 
-    with open("public_key.pem", "wb") as f:
-        f.write(
-            public_key.public_bytes(
-                serialization.Encoding.PEM,
-                serialization.PublicFormat.SubjectPublicKeyInfo
-            )
-        )
+    except OSError as e:
+        error(f"Could not write key files: {e}")
 
     print("Created private_key.pem")
     print("Created public_key.pem")
 
 
-def load_private_key() -> Ed25519PrivateKey:
-    if not os.path.exists("private_key.pem"):
-        error(
-            "private_key.pem not found. "
-            "Run the encoder again to create one."
-        )
+def load_private_key(path: str = PRIVATE_KEY):
+    """Load the Ed25519 private key, exiting on failure."""
 
-    try:
-        with open("private_key.pem", "rb") as f:
-            key = serialization.load_pem_private_key(
-                f.read(),
-                password=None
-            )
-    except Exception:
-        error("Could not load private_key.pem.")
-
-    if not isinstance(key, Ed25519PrivateKey):
-        error("private_key.pem is not an Ed25519 key.")
-
-    return key
+    return _guard(_read_private_key, path)
 
 
 # ============================================================
 # PAYLOAD
 # ============================================================
 
-def create_compressed_payload(prompt, model, version):
+def create_compressed_payload(
+    prompt: str,
+    model: str,
+    version: str,
+) -> bytes:
+    """Build a signed v0.2 ``WM01`` container."""
 
-    model_bytes = model.encode("utf-8")
-    version_bytes = version.encode("utf-8")
-    prompt_bytes = prompt.encode("utf-8")
-
-    if len(model_bytes) > 255:
-        error("Model name is too long.")
-
-    if len(version_bytes) > 255:
-        error("Model version is too long.")
-
-    compressed_prompt = zlib.compress(prompt_bytes)
-
-    if len(compressed_prompt) > 65535:
-        error("Prompt is too large.")
-
-    image_id = uuid.uuid4().bytes
-    timestamp = int(time.time())
-
-    # --------------------------------------------------------
-    # Payload body
-    #
-    # Unkomprimiert. Wird mit LZMA komprimiert und
-    # anschliessend signiert.
-    # --------------------------------------------------------
-    body = (
-
-        MAGIC +
-
-        # Model
-        bytes([len(model_bytes)]) +
-        model_bytes +
-
-        # Version
-        bytes([len(version_bytes)]) +
-        version_bytes +
-
-        # Image ID
-        image_id +
-
-        # Timestamp
-        struct.pack(">Q", timestamp) +
-
-        # Prompt length
-        struct.pack(">H", len(compressed_prompt)) +
-
-        # Prompt
-        compressed_prompt
+    body = _guard(
+        build_legacy_body,
+        model=model,
+        version=version,
+        prompt=prompt,
     )
 
     compressed_body = lzma.compress(
-        body,
-        lzma.FORMAT_XZ,
-        preset=9
+        body, lzma.FORMAT_XZ, preset=9
     )
 
     if len(compressed_body) > MAX_COMPRESSED_LENGTH:
         error(
-            f"Compressed payload is too large "
-            f"({len(compressed_body)} bytes, "
-            f"max {MAX_COMPRESSED_LENGTH})."
+            f"Compressed payload is too large: "
+            f"{len(compressed_body)} > {MAX_COMPRESSED_LENGTH} bytes. "
+            f"Shorten the prompt or use a weaker compression preset."
         )
 
-    # --------------------------------------------------------
-    # Sign body
-    #
-    # Signiert wird der unkomprimierte Body, nicht der
-    # LZMA-Stream. So ist die Signatur unabhaengig von der
-    # Kompressions-Einstellung.
-    # --------------------------------------------------------
-
-    private_key = load_private_key()
-
-    signature = private_key.sign(body)
-
-    # --------------------------------------------------------
-    # Container
-    #
-    # Die Laenge des komprimierten Bodies steht im Klartext,
-    # weil der Decoder sie kennen muss, BEVOR er den Body
-    # dekomprimieren kann.
-    # --------------------------------------------------------
+    # Signiert wird der unkomprimierte Body
+    signature = _read_private_key(PRIVATE_KEY).sign(body)
 
     return (
-        MAGIC +
-        struct.pack(
-            ">H",
-            len(compressed_body)
-        ) +
-        compressed_body +
-        signature
+        MAGIC
+        + struct.pack(">H", len(compressed_body))
+        + compressed_body
+        + signature
     )
 
 
@@ -220,252 +200,106 @@ def create_compressed_payload(prompt, model, version):
 # REED SOLOMON
 # ============================================================
 
-def reed_solomon_encode(data):
+def reed_solomon_encode(data: bytes) -> bytes:
+    """Reed-Solomon encode with the default parity."""
 
-    rs = RSCodec(RS_PARITY)
+    codec = RSCodec(RS_PARITY)
 
     try:
-        encoded = bytes(rs.encode(data))
+        encoded = bytes(codec.encode(data))
+
     except Exception as e:
         error(f"Reed-Solomon encoding failed: {e}")
 
-    # Der Decoder berechnet die Laenge des Codewords ueber
-    # rs_len(). Wenn reedsolo anders chunkt, ist die Laenge
-    # falsch und jedes Payload groesser als ein Chunk ist
-    # nicht mehr dekodierbar. Deshalb hier pruefen.
-    expected = rs_len(len(data))
-
-    if len(encoded) != expected:
+    if len(encoded) != rs_len(len(data)):
         error(
-            f"Unexpected Reed-Solomon length: "
-            f"got {len(encoded)} bytes, expected {expected}."
+            f"Reed-Solomon produced {len(encoded)} bytes, expected "
+            f"{rs_len(len(data))}. The reedsolo version does not "
+            f"match this build."
         )
 
     return encoded
 
 
 # ============================================================
-# BYTES -> BITS
+# BIT HELPERS
 # ============================================================
 
-def bytes_to_bits(data):
-
-    bits = []
-
-    for byte in data:
-
-        for i in range(7, -1, -1):
-
-            bits.append(
-                (byte >> i) & 1
-            )
-
-    return bits
+def bytes_to_bits(data: bytes) -> list[int]:
+    return dct.bytes_to_bits(data)
 
 
-# ============================================================
-# EMBED BIT
-# ============================================================
-
-def embed_bit(block, bit):
-
-    block = block.astype(np.float32)
-
-    dct = cv2.dct(block)
-
-    a = dct[COEF_A]
-    b = dct[COEF_B]
-
-    if bit == 1:
-
-        if a <= b:
-            dct[COEF_A] = b + STRENGTH
-            dct[COEF_B] = b
-        else:
-            dct[COEF_A] = a
-            dct[COEF_B] = a - STRENGTH
-
-    else:
-
-        if b <= a:
-            dct[COEF_B] = a + STRENGTH
-            dct[COEF_A] = a
-        else:
-            dct[COEF_B] = b
-            dct[COEF_A] = b - STRENGTH
-
-    result = cv2.idct(dct)
-
-    return np.clip(result, 0, 255)
+def embed_bit(block: np.ndarray, bit: int) -> np.ndarray:
+    return dct.embed_bit(block, bit, COEF_A, COEF_B, STRENGTH)
 
 
-# ============================================================
-# EMBED TILE
-# ============================================================
-
-def embed_tile(tile, bits):
-
-    ycrcb = cv2.cvtColor(
-        tile,
-        cv2.COLOR_RGB2YCrCb
+def embed_tile(tile: np.ndarray, bits: list[int]) -> np.ndarray:
+    return dct.embed_tile(
+        tile, bits, COEF_A, COEF_B, STRENGTH, BLOCK_SIZE
     )
 
-    luminance = ycrcb[:, :, 0].astype(np.float32)
-
-    bit_index = 0
-
-    for y in range(0, TILE_SIZE, 8):
-
-        for x in range(0, TILE_SIZE, 8):
-
-            # Keine Bits mehr?
-            # Einfach die restlichen Blöcke unverändert lassen.
-            if bit_index >= len(bits):
-                break
-
-            block = luminance[
-                y:y + 8,
-                x:x + 8
-            ]
-
-            luminance[
-                y:y + 8,
-                x:x + 8
-            ] = embed_bit(
-                block,
-                bits[bit_index]
-            )
-
-            bit_index += 1
-
-        # Wenn alle Bits geschrieben wurden,
-        # äußere Schleife ebenfalls verlassen.
-        if bit_index >= len(bits):
-            break
-
-    # WICHTIG:
-    # Veränderte Luminanz zurückschreiben.
-    ycrcb[:, :, 0] = luminance
-
-    result = cv2.cvtColor(
-        np.clip(
-            ycrcb,
-            0,
-            255
-        ).astype(np.uint8),
-        cv2.COLOR_YCrCb2RGB
-    )
-
-    return result
 
 # ============================================================
 # ENCODE IMAGE
 # ============================================================
 
 def encode_image(
-    input_path,
-    output_path,
-    prompt,
-    model,
-    version
-):
-
-    # --------------------------------------------------------
-    # Load
-    # --------------------------------------------------------
+    input_path: str,
+    output_path: str,
+    prompt: str,
+    model: str,
+    version: str,
+) -> None:
+    """Watermark an image with the v0.2 format and print a report."""
 
     if not os.path.exists(input_path):
-        error(
-            f"Input image not found: {input_path}"
-        )
+        error(f"Input image not found: {input_path}")
+
+    if not os.path.exists(PRIVATE_KEY):
+        print("No keys found.")
+        print("Generating Ed25519 key pair...")
+        create_keys()
+        print()
 
     print("[1/5] Loading image...")
+    image = _guard(dct.load_image, input_path)
 
-    try:
-        image = np.array(
-            Image.open(input_path).convert("RGB")
-        )
-    except Exception as e:
-        error(f"Could not open image: {e}")
-
-    height, width, _ = image.shape
+    height, width = image.shape[:2]
 
     if width < TILE_SIZE or height < TILE_SIZE:
         error(
-            f"Image must be at least "
-            f"{TILE_SIZE}x{TILE_SIZE} pixels."
+            f"Image must be at least {TILE_SIZE}x{TILE_SIZE} pixels."
         )
 
-    # --------------------------------------------------------
-    # Payload
-    # --------------------------------------------------------
+    print(f"      Image: {width}x{height}")
+    print(f"      Tile capacity: {TILE_BYTES} bytes (codeword)")
 
     print("[2/5] Creating payload...")
+    payload = create_compressed_payload(prompt, model, version)
 
-    payload = create_compressed_payload(
-        prompt,
-        model,
-        version
-    )
+    payload_length = len(payload)
 
-    print(
-        f"      Payload: {len(payload)} bytes"
-    )
+    print(f"      Payload: {payload_length} bytes")
 
-    # --------------------------------------------------------
-    # Reed Solomon
-    # --------------------------------------------------------
+    if rs_len(payload_length) > TILE_BYTES:
+        error(
+            f"Encoded payload is too large: "
+            f"{rs_len(payload_length)} > {TILE_BYTES} bytes. "
+            f"Shorten the prompt."
+        )
 
     print("[3/5] Reed-Solomon encoding...")
+    encoded = reed_solomon_encode(payload)
+    bits = bytes_to_bits(encoded)
 
-    encoded = reed_solomon_encode(
-        payload
-    )
-
-    print(
-        f"      Encoded: {len(encoded)} bytes"
-    )
-
-    # --------------------------------------------------------
-    # Kapazitaet
-    #
-    # Ein Tile hat 64x64 = 4096 DCT-Bloecke und damit
-    # 4096 Bit = 512 Byte Platz. Das RS-Codeword muss
-    # komplett hineinpassen.
-    # --------------------------------------------------------
-
-    if len(payload) > MAX_PAYLOAD_SIZE:
-        error(
-            f"Payload too large for one tile "
-            f"({len(payload)} bytes, max {MAX_PAYLOAD_SIZE})."
-        )
-
-    bits = bytes_to_bits(
-        encoded
-    )
-
-    if len(bits) > TILE_BLOCKS:
-        error(
-            f"Encoded payload too large for one tile "
-            f"({len(bits)} bits, max {TILE_BLOCKS})."
-        )
-
-    print(
-        f"      Watermark: {len(bits)} bits"
-    )
-
-    # --------------------------------------------------------
-    # Embed
-    # --------------------------------------------------------
+    print(f"      Encoded: {len(encoded)} bytes")
+    print(f"      Bits: {len(bits)}")
 
     print("[4/5] Embedding watermark...")
-
     output = image.copy()
 
     tiles_x = width // TILE_SIZE
     tiles_y = height // TILE_SIZE
-
-    tile_count = 0
 
     for ty in range(tiles_y):
 
@@ -474,78 +308,18 @@ def encode_image(
             x = tx * TILE_SIZE
             y = ty * TILE_SIZE
 
-            tile = output[
-                y:y + TILE_SIZE,
-                x:x + TILE_SIZE
-            ]
-
-            output[
-                y:y + TILE_SIZE,
-                x:x + TILE_SIZE
-            ] = embed_tile(
-                tile,
-                bits
+            output[y:y + TILE_SIZE, x:x + TILE_SIZE] = embed_tile(
+                output[y:y + TILE_SIZE, x:x + TILE_SIZE],
+                bits,
             )
 
-            tile_count += 1
-
-    print(
-        f"      Embedded into {tile_count} tiles"
-    )
-
-    # --------------------------------------------------------
-    # Save
-    # --------------------------------------------------------
-
     print("[5/5] Saving...")
+    _guard(dct.save_image, output_path, output)
 
-    try:
-        Image.fromarray(
-            output
-        ).save(
-            output_path,
-            format="PNG"
-        )
-    except Exception as e:
-        error(
-            f"Could not save output: {e}"
-        )
-
-    print()
     print("================================")
     print(" WATERMARK CREATED")
     print("================================")
-    print(f"Input:       {input_path}")
-    print(f"Output:      {output_path}")
-    print(f"Model:       {model or '(empty)'}")
-    print(f"Version:     {version or '(empty)'}")
-    print(f"Prompt:      {prompt or '(empty)'}")
-    print(f"Payload:     {len(payload)} bytes")
-    print(f"Encoded:     {len(encoded)} bytes")
-    print(f"Tiles:       {tile_count}")
+    print(f"Input:        {input_path}")
+    print(f"Output:       {output_path}")
+    print(f"Tiles:        {tiles_x * tiles_y}")
     print("================================")
-
-
-# ============================================================
-# MAIN
-# ============================================================
-if not os.path.exists("private_key.pem"):
-    print("No keys found.")
-    print("Generating Ed25519 key pair...")
-    create_keys()
-    print()
-
-if __name__ == "__main__":
-
-
-
-    encode_image(
-        input_path="input.png",
-        output_path="watermarked.png",
-
-        prompt="",
-
-        model="",
-
-        version=""
-    )
