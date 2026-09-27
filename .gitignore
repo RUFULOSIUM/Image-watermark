@@ -1,8 +1,7 @@
 .venv/
+.kilo/
 __pycache__/
 *.py[cod]
 private_key.pem
 public_key.pem
-benchmark/
-benchmark_results.csv
 .pytest_cache
